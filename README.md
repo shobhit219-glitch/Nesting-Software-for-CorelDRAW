@@ -61,10 +61,11 @@ Developed a macro-based automation tool that:
 
 ## 📸 Demo / Screenshots
 
-(Add screenshots or video here)
+<img width="1431" height="686" alt="Untitled" src="https://github.com/user-attachments/assets/5cb6d545-d917-4212-ae4c-27d087d86ced" />
+
 
 Example:
-- Before vs After layout
+- After nesting layout
 - Optimized nesting output
 
 ---

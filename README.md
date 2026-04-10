@@ -1,4 +1,3 @@
-# Nesting-Software-for-CorelDRAW
 # 🧩 CorelDraw Nesting Automation Macro
 
 A custom macro developed for CorelDraw to automatically arrange components on a page in a way that minimizes material wastage.

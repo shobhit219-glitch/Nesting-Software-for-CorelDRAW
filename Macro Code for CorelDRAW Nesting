@@ -1,58 +1,53 @@
 ' ============================================================================
-' ShoeNester v3.0 - Automated Nesting Macro for CorelDRAW X5
-' FIXES: No overlapping, components stay whole, markings preserved
+' ShoeNester v8.0 - WORKING True-Shape Nesting for CorelDRAW 2025
 ' ============================================================================
 '
+' FIX: Removed IsOnShape (doesn't work reliably in CDR2025).
+' Now uses curve-node polygon scanline fill for rasterization.
+'
+' HOW IT WORKS:
+'   1. Paste shape, read its curve nodes (actual outline points)
+'   2. Convert nodes to pixel coordinates relative to shape origin
+'   3. Scanline-fill the polygon onto a pixel bitmap
+'   4. Use that bitmap for collision-free placement on the master grid
+'   5. Shapes interlock into each other's concavities
+'
 ' INSTALLATION:
-' 1. Open CorelDRAW X5
-' 2. Tools > Macro > Macro Manager
-' 3. If "ShoeNester" project already exists, expand it and double-click
-'    the NestingEngine module to edit it
-'    OR create new project: Right-click > New Macro Project > name "ShoeNester"
-'    Then right-click ShoeNester > New > Module > name "NestingEngine"
-' 4. DELETE all old code in the module
-' 5. Open this file in Notepad, Ctrl+A, Ctrl+C
-' 6. Paste into the VBA Editor module (Ctrl+V)
-' 7. Ctrl+S to save, close VBA Editor
-' 8. Alt+F8 > select ShoeNester.NestingEngine.RunShoeNester > Run
+'   Alt+Shift+F11 > GlobalMacros > NestingEngine
+'   Delete old code, paste this, Ctrl+S, Alt+F8 > Run
 '
 ' ============================================================================
 
 Option Explicit
 
-' ---- Grid resolution (mm per cell) ----
-' Smaller = more accurate placement but slower
-' 1mm is good balance for shoe components
-Private Const GRID_STEP As Double = 1
+Private Const CELL As Double = 3  ' Pixel size in mm
 
-' ---- Settings (gathered from user) ----
 Private m_SheetW As Double
 Private m_SheetH As Double
 Private m_Gap As Double
 Private m_Copies As Long
 Private m_DoRotate As Boolean
 Private m_Margin As Double
+Private m_UsableW As Double
+Private m_UsableH As Double
 
-' ---- Grid occupancy ----
-Private m_GridCols As Long
-Private m_GridRows As Long
-Private m_Grid() As Boolean  ' True = cell is occupied
+Private m_GW As Long
+Private m_GH As Long
+Private m_Grid() As Boolean
+Private m_RowFull() As Boolean
+
 
 ' ============================================================================
-' MAIN ENTRY POINT
+' MAIN
 ' ============================================================================
 Public Sub RunShoeNester()
-
     On Error GoTo ErrHandler
     
-    ' --- Check document ---
     If Documents.Count = 0 Then
-        MsgBox "Please open a document with your shoe components first!", _
-               vbExclamation, "ShoeNester"
+        MsgBox "Open a document with shoe components first!", vbExclamation, "ShoeNester"
         Exit Sub
     End If
     
-    ' --- Get source shapes ---
     Dim srcDoc As Document
     Set srcDoc = ActiveDocument
     
@@ -64,46 +59,20 @@ Public Sub RunShoeNester()
     End If
     
     If sr.Count = 0 Then
-        MsgBox "No shapes found!" & vbCrLf & vbCrLf & _
-               "SELECT the components you want to nest, or" & vbCrLf & _
-               "make sure they are on the active page.", _
-               vbExclamation, "ShoeNester"
+        MsgBox "No shapes found!", vbExclamation, "ShoeNester"
         Exit Sub
     End If
     
-    ' --- Welcome ---
     Dim msg As String
-    msg = "ShoeNester v3.0 - Component Nesting" & vbCrLf & vbCrLf
-    msg = msg & "Found: " & sr.Count & " component(s) on page" & vbCrLf & vbCrLf
-    msg = msg & "IMPORTANT:" & vbCrLf
-    msg = msg & "- Each component (with all its markings/text) will" & vbCrLf
-    msg = msg & "  be kept together as one unit" & vbCrLf
-    msg = msg & "- Components will be arranged CLOSELY but will" & vbCrLf
-    msg = msg & "  NEVER overlap each other" & vbCrLf & vbCrLf
-    msg = msg & "Click OK to set up nesting parameters."
+    msg = "ShoeNester v8.0 - True-Shape Nesting" & vbCrLf
+    msg = msg & "Found: " & sr.Count & " component(s)" & vbCrLf & vbCrLf
+    msg = msg & "Click OK to configure."
+    If MsgBox(msg, vbOKCancel + vbInformation, "ShoeNester") = vbCancel Then Exit Sub
     
-    If MsgBox(msg, vbOKCancel + vbInformation, "ShoeNester") = vbCancel Then
-        Exit Sub
-    End If
-    
-    ' --- Sheet size ---
-    Dim presetChoice As String
-    presetChoice = InputBox( _
-        "Choose sheet size:" & vbCrLf & vbCrLf & _
-        "  1 = A4  (210 x 297 mm)" & vbCrLf & _
-        "  2 = A3  (297 x 420 mm)" & vbCrLf & _
-        "  3 = A2  (420 x 594 mm)" & vbCrLf & _
-        "  4 = A1  (594 x 841 mm)" & vbCrLf & _
-        "  5 = A0  (841 x 1189 mm)" & vbCrLf & _
-        "  6 = Letter (216 x 279 mm)" & vbCrLf & _
-        "  7 = 24x36 inch (610 x 914 mm)" & vbCrLf & _
-        "  8 = Custom" & vbCrLf & vbCrLf & _
-        "Enter number (1-8):", _
-        "ShoeNester - Sheet Size", "3")
-    
-    If presetChoice = "" Then Exit Sub
-    
-    Select Case Val(presetChoice)
+    Dim ps As String
+    ps = InputBox("Sheet: 1=A4 2=A3 3=A2 4=A1 5=A0 6=Letter 7=24x36 8=Custom", "ShoeNester", "3")
+    If ps = "" Then Exit Sub
+    Select Case Val(ps)
         Case 1: m_SheetW = 210: m_SheetH = 297
         Case 2: m_SheetW = 297: m_SheetH = 420
         Case 3: m_SheetW = 420: m_SheetH = 594
@@ -112,504 +81,634 @@ Public Sub RunShoeNester()
         Case 6: m_SheetW = 216: m_SheetH = 279
         Case 7: m_SheetW = 610: m_SheetH = 914
         Case 8
-            Dim cw As String, ch As String
-            cw = InputBox("Enter sheet WIDTH in mm:", "ShoeNester", "600")
-            If cw = "" Then Exit Sub
-            ch = InputBox("Enter sheet HEIGHT in mm:", "ShoeNester", "900")
-            If ch = "" Then Exit Sub
-            m_SheetW = Val(cw): m_SheetH = Val(ch)
-        Case Else
-            m_SheetW = 420: m_SheetH = 594
+            Dim wS As String
+            Dim hS As String
+            wS = InputBox("Width (mm):", "ShoeNester", "600")
+            If wS = "" Then Exit Sub
+            hS = InputBox("Height (mm):", "ShoeNester", "900")
+            If hS = "" Then Exit Sub
+            m_SheetW = Val(wS): m_SheetH = Val(hS)
+        Case Else: m_SheetW = 420: m_SheetH = 594
     End Select
     
-    ' --- Spacing ---
-    Dim sGap As String
-    sGap = InputBox("Gap between components (mm):" & vbCrLf & _
-                     "(Recommended: 2-5 mm for plotter cutting)", _
-                     "ShoeNester - Spacing", "3")
-    If sGap = "" Then Exit Sub
-    m_Gap = Val(sGap)
-    If m_Gap < 0 Then m_Gap = 0
+    Dim sg As String
+    sg = InputBox("Gap (mm):", "ShoeNester", "3")
+    If sg = "" Then Exit Sub
+    m_Gap = Val(sg)
     
-    ' --- Copies ---
-    Dim sCopies As String
-    sCopies = InputBox("How many copies of EACH component?" & vbCrLf & _
-                        "(Enter 1 for single set)", _
-                        "ShoeNester - Copies", "1")
-    If sCopies = "" Then Exit Sub
-    m_Copies = CLng(Val(sCopies))
+    Dim scp As String
+    scp = InputBox("Copies per component:", "ShoeNester", "1")
+    If scp = "" Then Exit Sub
+    m_Copies = CLng(Val(scp))
     If m_Copies < 1 Then m_Copies = 1
     
-    ' --- Rotation ---
-    Dim sRot As Long
-    sRot = MsgBox("Allow 90-degree rotation for better fit?" & vbCrLf & vbCrLf & _
-                   "YES = Rotate pieces to save space" & vbCrLf & _
-                   "NO  = Keep original orientation", _
-                   vbYesNo + vbQuestion, "ShoeNester - Rotation")
-    m_DoRotate = (sRot = vbYes)
+    m_DoRotate = (MsgBox("Allow rotation?", vbYesNo, "ShoeNester") = vbYes)
     
-    ' --- Margins ---
-    Dim sMargin As String
-    sMargin = InputBox("Margin around all edges (mm):" & vbCrLf & _
-                        "(Safe zone for plotter)", _
-                        "ShoeNester - Margins", "5")
-    If sMargin = "" Then Exit Sub
-    m_Margin = Val(sMargin)
-    If m_Margin < 0 Then m_Margin = 0
+    Dim sm As String
+    sm = InputBox("Margin (mm):", "ShoeNester", "5")
+    If sm = "" Then Exit Sub
+    m_Margin = Val(sm)
     
-    ' --- Confirm ---
-    Dim totalPieces As Long
-    totalPieces = sr.Count * m_Copies
-    
-    msg = "Ready to nest!" & vbCrLf & vbCrLf
-    msg = msg & "Components: " & sr.Count & vbCrLf
-    msg = msg & "Copies each: " & m_Copies & vbCrLf
-    msg = msg & "Total pieces: " & totalPieces & vbCrLf
-    msg = msg & "Sheet: " & m_SheetW & " x " & m_SheetH & " mm" & vbCrLf
-    msg = msg & "Spacing: " & m_Gap & " mm" & vbCrLf
-    msg = msg & "Margins: " & m_Margin & " mm" & vbCrLf
-    msg = msg & "Rotation: " & MyIIf(m_DoRotate, "Yes", "No") & vbCrLf & vbCrLf
-    msg = msg & "Your original file will NOT be modified." & vbCrLf
-    msg = msg & "Proceed?"
-    
-    If MsgBox(msg, vbOKCancel + vbInformation, "ShoeNester - Confirm") = vbCancel Then
+    m_UsableW = m_SheetW - m_Margin * 2
+    m_UsableH = m_SheetH - m_Margin * 2
+    If m_UsableW <= 0 Or m_UsableH <= 0 Then
+        MsgBox "Margins too large!", vbExclamation, "ShoeNester"
         Exit Sub
     End If
     
-    ' ====================================================================
-    ' STEP 1: GROUP EACH COMPONENT (preserve identity)
-    ' ====================================================================
-    ' We need to ensure each component (with its internal markings,
-    ' text, stitching lines etc.) is treated as ONE unit.
-    ' We do this by recording each shape's bounding box from the source.
-    ' When we copy to destination, we copy and group if needed.
-    '
-    ' NOTE: If user already grouped their components, sr() contains groups.
-    ' If components are individual curves, each sr(i) is one component.
-    ' We trust the user's selection/page as defining individual components.
-    ' ====================================================================
-    
-    Application.Optimization = True
-    
-    ' Usable area
-    Dim usableW As Double, usableH As Double
-    usableW = m_SheetW - (m_Margin * 2)
-    usableH = m_SheetH - (m_Margin * 2)
-    
-    If usableW <= 0 Or usableH <= 0 Then
-        MsgBox "Margins are too large for the sheet size!", vbExclamation, "ShoeNester"
-        Application.Optimization = False
-        Exit Sub
-    End If
-    
-    ' ====================================================================
-    ' STEP 2: BUILD ITEM LIST
-    ' Record bounding box of each source shape (the ACTUAL size)
-    ' ====================================================================
     Dim totalItems As Long
     totalItems = sr.Count * m_Copies
     
-    ' Arrays for item info
-    Dim itemOrigW() As Double   ' Original width of shape (no gap)
-    Dim itemOrigH() As Double   ' Original height of shape (no gap)
-    Dim itemSrcIdx() As Long    ' Which source shape
-    ReDim itemOrigW(1 To totalItems)
-    ReDim itemOrigH(1 To totalItems)
-    ReDim itemSrcIdx(1 To totalItems)
+    msg = "Pieces: " & totalItems & " | Sheet: " & m_SheetW & "x" & m_SheetH & "mm | Proceed?"
+    If MsgBox(msg, vbOKCancel, "ShoeNester") = vbCancel Then Exit Sub
     
-    Dim idx As Long, i As Long, c As Long
+    Application.Optimization = True
+    
+    ' Sort largest first
+    Dim itemSrc() As Long
+    Dim itemAr() As Double
+    ReDim itemSrc(1 To totalItems)
+    ReDim itemAr(1 To totalItems)
+    Dim idx As Long
+    Dim i As Long
+    Dim c As Long
     idx = 0
     For i = 1 To sr.Count
-        Dim sw As Double, sh As Double
-        sw = sr(i).SizeWidth
-        sh = sr(i).SizeHeight
+        Dim ar As Double
+        ar = sr(i).SizeWidth * sr(i).SizeHeight
         For c = 1 To m_Copies
             idx = idx + 1
-            itemOrigW(idx) = sw
-            itemOrigH(idx) = sh
-            itemSrcIdx(idx) = i
+            itemSrc(idx) = i
+            itemAr(idx) = ar
         Next c
     Next i
     
-    ' ====================================================================
-    ' STEP 3: SORT BY AREA DESCENDING (largest first = better packing)
-    ' ====================================================================
-    Dim swapped As Boolean
-    Dim tmpD As Double, tmpL As Long
+    Dim swp As Boolean
+    Dim td As Double
+    Dim tl As Long
     Do
-        swapped = False
+        swp = False
         For i = 1 To totalItems - 1
-            If (itemOrigW(i) * itemOrigH(i)) < (itemOrigW(i + 1) * itemOrigH(i + 1)) Then
-                tmpD = itemOrigW(i): itemOrigW(i) = itemOrigW(i + 1): itemOrigW(i + 1) = tmpD
-                tmpD = itemOrigH(i): itemOrigH(i) = itemOrigH(i + 1): itemOrigH(i + 1) = tmpD
-                tmpL = itemSrcIdx(i): itemSrcIdx(i) = itemSrcIdx(i + 1): itemSrcIdx(i + 1) = tmpL
-                swapped = True
+            If itemAr(i) < itemAr(i + 1) Then
+                td = itemAr(i): itemAr(i) = itemAr(i + 1): itemAr(i + 1) = td
+                tl = itemSrc(i): itemSrc(i) = itemSrc(i + 1): itemSrc(i + 1) = tl
+                swp = True
             End If
         Next i
-    Loop While swapped
+    Loop While swp
     
-    ' ====================================================================
-    ' STEP 4: CREATE DESTINATION DOCUMENT
-    ' ====================================================================
+    ' Create dest doc
     Dim destDoc As Document
     Set destDoc = CreateDocument
     destDoc.Unit = cdrMillimeter
-    
     Dim pg As Page
     Set pg = destDoc.Pages(1)
     pg.SetSize m_SheetW, m_SheetH
+    Call InitGrid
+    Call DrawBox(pg)
     
-    ' Init grid for first page
-    Call InitGrid(usableW, usableH)
-    Call DrawMarginBox(pg)
+    Dim pgCnt As Long
+    pgCnt = 1
+    Dim plCnt As Long
+    plCnt = 0
     
-    Dim pageCount As Long
-    pageCount = 1
-    Dim placedCount As Long
-    placedCount = 0
-    
-    ' ====================================================================
-    ' STEP 5: PLACE EACH ITEM
-    ' ====================================================================
     For i = 1 To totalItems
-        
-        ' The space this item needs INCLUDING the gap on right and bottom
-        Dim needW As Double, needH As Double
-        needW = itemOrigW(i) + m_Gap
-        needH = itemOrigH(i) + m_Gap
-        
-        ' Try to find a free position
-        Dim posX As Double, posY As Double
-        Dim rotated As Boolean
-        Dim foundSpot As Boolean
-        
-        foundSpot = FindFreeSpot(needW, needH, usableW, usableH, posX, posY, rotated)
-        
-        ' If no space on current page, make a new page
-        If Not foundSpot Then
-            Set pg = destDoc.AddPages(1)
-            pg.SetSize m_SheetW, m_SheetH
-            pageCount = pageCount + 1
-            Call InitGrid(usableW, usableH)
-            Call DrawMarginBox(pg)
-            foundSpot = FindFreeSpot(needW, needH, usableW, usableH, posX, posY, rotated)
-        End If
-        
-        If foundSpot Then
-            ' === COPY THE COMPONENT AS A WHOLE UNIT ===
-            
-            ' Step A: Activate source doc and copy the shape
-            srcDoc.Activate
-            sr(itemSrcIdx(i)).Copy
-            
-            ' Step B: Activate destination page and paste
-            destDoc.Activate
-            pg.Activate
-            ActiveLayer.Paste
-            
-            ' Step C: Get the pasted shape
-            ' Paste might give us one shape or multiple shapes in selection
-            ' We GROUP everything that was pasted to keep it as one unit
-            Dim pastedShape As Shape
-            
-            If ActiveSelection.Shapes.Count > 1 Then
-                ' Multiple objects pasted - group them to keep identity
-                Set pastedShape = ActiveSelection.Group
-            Else
-                Set pastedShape = ActiveSelection.Shapes(1)
-            End If
-            
-            ' Step D: Apply rotation BEFORE positioning
-            If rotated Then
-                ' Rotate around shape's own center
-                pastedShape.Rotate 90
-            End If
-            
-            ' Step E: READ the actual bounding box of the pasted (possibly rotated) shape
-            ' CorelDRAW bounding box: LeftX, BottomY, RightX, TopY
-            Dim shpLeft As Double, shpTop As Double
-            Dim shpW As Double, shpH As Double
-            shpLeft = pastedShape.LeftX
-            shpTop = pastedShape.TopY
-            shpW = pastedShape.SizeWidth
-            shpH = pastedShape.SizeHeight
-            
-            ' Step F: CALCULATE where the shape should go
-            ' posX, posY are in USABLE AREA coordinates (top-left origin)
-            ' We need to convert to PAGE coordinates (CorelDRAW: bottom-left origin, Y goes up)
-            '
-            ' Target position for shape's LEFT edge:
-            Dim targetLeft As Double
-            targetLeft = m_Margin + posX
-            '
-            ' Target position for shape's TOP edge:
-            ' In usable area coords, posY is distance from top
-            ' In CorelDRAW page coords, top of usable area = m_SheetH - m_Margin
-            Dim targetTop As Double
-            targetTop = (m_SheetH - m_Margin) - posY
-            
-            ' Step G: MOVE the shape by calculating offset from current position
-            Dim offsetX As Double, offsetY As Double
-            offsetX = targetLeft - shpLeft
-            offsetY = targetTop - shpTop
-            
-            pastedShape.Move offsetX, offsetY
-            
-            ' Step H: Mark the grid cells as occupied
-            ' Use the ACTUAL shape dimensions + gap for grid marking
-            Dim markW As Double, markH As Double
-            markW = pastedShape.SizeWidth + m_Gap
-            markH = pastedShape.SizeHeight + m_Gap
-            Call MarkGridOccupied(posX, posY, markW, markH)
-            
-            ' Deselect
-            ActiveDocument.ClearSelection
-            
-            placedCount = placedCount + 1
-        End If
-        
-        ' Status update
-        If (i Mod 3 = 0) Or (i = totalItems) Then
-            Application.StatusBar = "ShoeNester: Placing " & i & "/" & totalItems & _
-                                    " (" & pageCount & " page" & MyIIf(pageCount > 1, "s", "") & ")"
-        End If
+        Application.StatusBar = "ShoeNester: " & i & "/" & totalItems & " (Pg " & pgCnt & ")"
         DoEvents
         
+        Dim ok As Boolean
+        ok = PlaceItem(srcDoc, sr, itemSrc(i), destDoc, pg)
+        
+        If Not ok Then
+            Set pg = destDoc.AddPages(1)
+            pg.SetSize m_SheetW, m_SheetH
+            pgCnt = pgCnt + 1
+            Call InitGrid
+            Call DrawBox(pg)
+            ok = PlaceItem(srcDoc, sr, itemSrc(i), destDoc, pg)
+        End If
+        
+        If ok Then plCnt = plCnt + 1
     Next i
     
-    ' ====================================================================
-    ' DONE
-    ' ====================================================================
     Application.Optimization = False
     Application.StatusBar = ""
-    ActiveWindow.Refresh
-    
-    ' Activate destination document and go to page 1
     destDoc.Activate
     destDoc.Pages(1).Activate
-    ActiveWindow.Zoom 75
+    ActiveWindow.Refresh
     
-    MsgBox "NESTING COMPLETE!" & vbCrLf & vbCrLf & _
-           "Placed: " & placedCount & " / " & totalItems & " components" & vbCrLf & _
-           "Pages: " & pageCount & vbCrLf & vbCrLf & _
-           "Your original file is untouched." & vbCrLf & _
-           "Review the layout, then send to your plotter!", _
+    MsgBox "Done! Placed " & plCnt & "/" & totalItems & " on " & pgCnt & " page(s).", _
            vbInformation, "ShoeNester"
-    
     Exit Sub
-    
 ErrHandler:
     Application.Optimization = False
     Application.StatusBar = ""
-    MsgBox "Error #" & Err.Number & vbCrLf & Err.Description, _
-           vbCritical, "ShoeNester Error"
+    MsgBox "Error #" & Err.Number & ": " & Err.Description, vbCritical, "ShoeNester"
 End Sub
 
 
 ' ============================================================================
-' GRID INITIALIZATION
+' PLACE ONE ITEM
 ' ============================================================================
-Private Sub InitGrid(ByVal w As Double, ByVal h As Double)
-    m_GridCols = CLng(w / GRID_STEP) + 1
-    m_GridRows = CLng(h / GRID_STEP) + 1
+Private Function PlaceItem(ByRef srcDoc As Document, _
+                            ByRef sr As ShapeRange, _
+                            ByVal srcIdx As Long, _
+                            ByRef destDoc As Document, _
+                            ByRef pg As Page) As Boolean
+    PlaceItem = False
     
-    ReDim m_Grid(0 To m_GridCols - 1, 0 To m_GridRows - 1)
+    ' Copy & paste
+    srcDoc.Activate
+    sr(srcIdx).Copy
+    destDoc.Activate
+    pg.Activate
+    ActiveLayer.Paste
     
-    ' All cells start as FREE (False)
-    Dim gx As Long, gy As Long
-    For gy = 0 To m_GridRows - 1
-        For gx = 0 To m_GridCols - 1
-            m_Grid(gx, gy) = False
-        Next gx
-    Next gy
-End Sub
-
-
-' ============================================================================
-' FIND A FREE SPOT ON THE GRID
-' Uses top-left fill: scans row by row (top to bottom), column by column
-' (left to right), and returns the first position where the item fits
-' without overlapping any occupied cells.
-' ============================================================================
-Private Function FindFreeSpot(ByVal needW As Double, ByVal needH As Double, _
-                               ByVal areaW As Double, ByVal areaH As Double, _
-                               ByRef outX As Double, ByRef outY As Double, _
-                               ByRef outRotated As Boolean) As Boolean
-    
-    FindFreeSpot = False
-    
-    ' Try both orientations (normal first, then rotated)
-    Dim pass As Long
-    Dim maxPass As Long
-    If m_DoRotate Then maxPass = 2 Else maxPass = 1
-    
-    Dim bestRow As Long, bestCol As Long, bestPass As Long
-    Dim bestScore As Double
-    bestScore = 1E+30
-    Dim found As Boolean
-    found = False
-    
-    For pass = 1 To maxPass
-        Dim tryW As Double, tryH As Double
-        
-        If pass = 1 Then
-            tryW = needW
-            tryH = needH
-        Else
-            ' Rotated: swap width and height
-            tryW = needH
-            tryH = needW
-        End If
-        
-        ' Check if this orientation fits in the usable area at all
-        If tryW > areaW Or tryH > areaH Then GoTo NextPass
-        
-        ' How many grid cells does this item occupy?
-        Dim cellsW As Long, cellsH As Long
-        cellsW = CLng(tryW / GRID_STEP)
-        If cellsW < 1 Then cellsW = 1
-        cellsH = CLng(tryH / GRID_STEP)
-        If cellsH < 1 Then cellsH = 1
-        
-        ' Scan the grid: row by row (top to bottom), col by col (left to right)
-        Dim row As Long, col As Long
-        
-        For row = 0 To m_GridRows - cellsH
-            For col = 0 To m_GridCols - cellsW
-                
-                ' Quick skip: if anchor cell is occupied, skip
-                If m_Grid(col, row) Then GoTo NextCell
-                
-                ' Check if entire rectangle is free
-                If IsBlockFree(col, row, cellsW, cellsH) Then
-                    ' This position works!
-                    ' Score by row first (top preference) then column (left preference)
-                    Dim score As Double
-                    score = CDbl(row) * 1000000 + CDbl(col)
-                    
-                    If score < bestScore Then
-                        bestScore = score
-                        bestRow = row
-                        bestCol = col
-                        bestPass = pass
-                        found = True
-                        ' First free spot in this row is best for this pass
-                        GoTo DoneThisPass
-                    End If
-                End If
-                
-NextCell:
-            Next col
-        Next row
-        
-DoneThisPass:
-NextPass:
-    Next pass
-    
-    If found Then
-        outX = CDbl(bestCol) * GRID_STEP
-        outY = CDbl(bestRow) * GRID_STEP
-        outRotated = (bestPass = 2)
-        FindFreeSpot = True
-    End If
-    
-End Function
-
-
-' ============================================================================
-' CHECK IF A BLOCK OF GRID CELLS IS ENTIRELY FREE
-' ============================================================================
-Private Function IsBlockFree(ByVal startCol As Long, ByVal startRow As Long, _
-                              ByVal numCols As Long, ByVal numRows As Long) As Boolean
-    
-    Dim endCol As Long, endRow As Long
-    endCol = startCol + numCols - 1
-    endRow = startRow + numRows - 1
-    
-    ' Bounds check
-    If endCol >= m_GridCols Or endRow >= m_GridRows Then
-        IsBlockFree = False
+    Dim shp As Shape
+    If ActiveSelection.Shapes.Count > 1 Then
+        Set shp = ActiveSelection.Group
+    ElseIf ActiveSelection.Shapes.Count = 1 Then
+        Set shp = ActiveSelection.Shapes(1)
+    Else
         Exit Function
     End If
     
-    Dim r As Long, cc As Long
-    For r = startRow To endRow
-        For cc = startCol To endCol
-            If m_Grid(cc, r) Then
-                IsBlockFree = False
-                Exit Function
-            End If
-        Next cc
-    Next r
+    shp.Move -9999, -9999
     
-    IsBlockFree = True
+    ' Rotation angles
+    Dim ang() As Double
+    Dim nA As Long
+    If m_DoRotate Then
+        nA = 12
+        ReDim ang(1 To 12)
+        Dim k As Long
+        For k = 1 To 12
+            ang(k) = (k - 1) * 15
+        Next k
+    Else
+        nA = 1
+        ReDim ang(1 To 1)
+        ang(1) = 0
+    End If
+    
+    Dim origR As Double
+    origR = shp.RotationAngle
+    
+    Dim bestAI As Long
+    Dim bestGX As Long
+    Dim bestGY As Long
+    Dim bestSc As Double
+    Dim found As Boolean
+    bestSc = 1E+30
+    found = False
+    
+    Dim ai As Long
+    For ai = 1 To nA
+        
+        ' Apply rotation
+        shp.RotationAngle = origR
+        If ang(ai) <> 0 Then shp.Rotate ang(ai)
+        
+        ' ============================================================
+        ' RASTERIZE SHAPE ONCE using curve nodes + scanline fill
+        ' ============================================================
+        Dim shpW As Double
+        Dim shpH As Double
+        shpW = shp.SizeWidth
+        shpH = shp.SizeHeight
+        
+        Dim hg As Double
+        hg = m_Gap / 2
+        
+        ' Footprint pixel dimensions (shape + gap)
+        Dim fpW As Long
+        Dim fpH As Long
+        fpW = CLng((shpW + m_Gap) / CELL) + 2
+        fpH = CLng((shpH + m_Gap) / CELL) + 2
+        
+        If fpW > m_GW Or fpH > m_GH Then GoTo NxtAng
+        If fpW < 1 Or fpH < 1 Then GoTo NxtAng
+        
+        ' Build footprint by extracting outline points and filling
+        Dim fp() As Boolean
+        ReDim fp(0 To fpW - 1, 0 To fpH - 1)
+        
+        Call RasterizeShape(shp, fp, fpW, fpH, hg)
+        
+        ' Verify footprint has pixels (if not, fall back to filled rect)
+        Dim hasPix As Boolean
+        hasPix = False
+        Dim ci As Long
+        Dim cj As Long
+        For cj = 0 To fpH - 1
+            For ci = 0 To fpW - 1
+                If fp(ci, cj) Then
+                    hasPix = True
+                    GoTo CheckDone
+                End If
+            Next ci
+        Next cj
+CheckDone:
+        
+        ' FALLBACK: if rasterization produced nothing, fill entire bounding box
+        ' This ensures shapes ALWAYS get placed even if node extraction fails
+        If Not hasPix Then
+            For cj = 0 To fpH - 1
+                For ci = 0 To fpW - 1
+                    fp(ci, cj) = True
+                Next ci
+            Next cj
+        End If
+        
+        ' ============================================================
+        ' SCAN GRID FOR PLACEMENT (using cached footprint)
+        ' ============================================================
+        Dim gRow As Long
+        Dim gCol As Long
+        
+        For gRow = 0 To m_GH - fpH
+            If m_RowFull(gRow) Then GoTo NxtRow
+            
+            For gCol = 0 To m_GW - fpW
+                If m_Grid(gCol, gRow) Then GoTo NxtCol
+                
+                If Not Collides(fp, fpW, fpH, gCol, gRow) Then
+                    Dim score As Double
+                    score = CDbl(gRow) * 1000000 + CDbl(gCol)
+                    If score < bestSc Then
+                        bestSc = score
+                        bestAI = ai
+                        bestGX = gCol
+                        bestGY = gRow
+                        found = True
+                        GoTo DnAng
+                    End If
+                End If
+NxtCol:
+            Next gCol
+NxtRow:
+        Next gRow
+        
+DnAng:
+NxtAng:
+    Next ai
+    
+    If Not found Then
+        shp.Delete
+        Exit Function
+    End If
+    
+    ' Apply winning rotation
+    shp.RotationAngle = origR
+    If ang(bestAI) <> 0 Then shp.Rotate ang(bestAI)
+    
+    ' Rebuild footprint for stamping
+    Dim hg2 As Double
+    hg2 = m_Gap / 2
+    shpW = shp.SizeWidth
+    shpH = shp.SizeHeight
+    fpW = CLng((shpW + m_Gap) / CELL) + 2
+    fpH = CLng((shpH + m_Gap) / CELL) + 2
+    ReDim fp(0 To fpW - 1, 0 To fpH - 1)
+    Call RasterizeShape(shp, fp, fpW, fpH, hg2)
+    
+    ' Check if rasterization worked, fallback to rect if not
+    hasPix = False
+    For cj = 0 To fpH - 1
+        For ci = 0 To fpW - 1
+            If fp(ci, cj) Then hasPix = True: GoTo StampReady
+        Next ci
+    Next cj
+StampReady:
+    If Not hasPix Then
+        For cj = 0 To fpH - 1
+            For ci = 0 To fpW - 1
+                fp(ci, cj) = True
+            Next ci
+        Next cj
+    End If
+    
+    ' Move shape to position
+    Dim tgtL As Double
+    Dim tgtB As Double
+    tgtL = m_Margin + CDbl(bestGX) * CELL + hg2
+    tgtB = m_Margin + CDbl(bestGY) * CELL + hg2
+    shp.Move tgtL - shp.LeftX, tgtB - shp.BottomY
+    
+    ' Stamp onto master grid
+    Call Stamp(fp, fpW, fpH, bestGX, bestGY)
+    
+    destDoc.ClearSelection
+    PlaceItem = True
 End Function
 
 
 ' ============================================================================
-' MARK GRID CELLS AS OCCUPIED
+' RASTERIZE A SHAPE using its curve outline nodes
+' Extracts all node X,Y positions, converts to pixel grid,
+' then fills the polygon using scanline algorithm
 ' ============================================================================
-Private Sub MarkGridOccupied(ByVal posX As Double, ByVal posY As Double, _
-                              ByVal w As Double, ByVal h As Double)
+Private Sub RasterizeShape(ByRef shp As Shape, ByRef fp() As Boolean, _
+                            ByVal fpW As Long, ByVal fpH As Long, ByVal halfGap As Double)
     
-    Dim startCol As Long, startRow As Long
-    Dim endCol As Long, endRow As Long
+    ' Origin = shape's bottom-left minus half gap
+    Dim origX As Double
+    Dim origY As Double
+    origX = shp.LeftX - halfGap
+    origY = shp.BottomY - halfGap
     
-    startCol = CLng(posX / GRID_STEP)
-    startRow = CLng(posY / GRID_STEP)
-    endCol = CLng((posX + w) / GRID_STEP)
-    endRow = CLng((posY + h) / GRID_STEP)
+    ' Collect all node points from the shape
+    ' Works with curves, groups, and any shape type
+    Dim nodeCount As Long
+    nodeCount = 0
     
-    ' Clamp to grid bounds
-    If startCol < 0 Then startCol = 0
-    If startRow < 0 Then startRow = 0
-    If endCol >= m_GridCols Then endCol = m_GridCols - 1
-    If endRow >= m_GridRows Then endRow = m_GridRows - 1
+    ' First pass: count nodes
+    Dim nodeX() As Double
+    Dim nodeY() As Double
+    ReDim nodeX(1 To 5000)
+    ReDim nodeY(1 To 5000)
     
-    Dim r As Long, cc As Long
-    For r = startRow To endRow
-        For cc = startCol To endCol
-            m_Grid(cc, r) = True
-        Next cc
-    Next r
+    Call CollectNodes(shp, origX, origY, nodeX, nodeY, nodeCount)
+    
+    ' If no nodes collected, mark entire footprint as filled (bounding box fallback)
+    If nodeCount < 3 Then
+        Dim fi As Long
+        Dim fj As Long
+        For fj = 0 To fpH - 1
+            For fi = 0 To fpW - 1
+                fp(fi, fj) = True
+            Next fi
+        Next fj
+        Exit Sub
+    End If
+    
+    ' Scanline fill: for each row of pixels, find intersections with polygon edges
+    ' and fill between pairs
+    Dim row As Long
+    Dim rowY As Double
+    Dim intersections() As Double
+    ReDim intersections(1 To 500)
+    Dim intCount As Long
+    
+    For row = 0 To fpH - 1
+        rowY = CDbl(row) + 0.5  ' Center of pixel row
+        intCount = 0
+        
+        ' Check each edge of the polygon
+        Dim e As Long
+        Dim x1 As Double
+        Dim y1 As Double
+        Dim x2 As Double
+        Dim y2 As Double
+        Dim nextE As Long
+        
+        For e = 1 To nodeCount
+            If e < nodeCount Then
+                nextE = e + 1
+            Else
+                nextE = 1
+            End If
+            
+            x1 = nodeX(e)
+            y1 = nodeY(e)
+            x2 = nodeX(nextE)
+            y2 = nodeY(nextE)
+            
+            ' Check if this edge crosses the scanline
+            If (y1 <= rowY And y2 > rowY) Or (y2 <= rowY And y1 > rowY) Then
+                ' Compute intersection X
+                Dim intX As Double
+                If Abs(y2 - y1) > 0.001 Then
+                    intX = x1 + (rowY - y1) / (y2 - y1) * (x2 - x1)
+                Else
+                    intX = x1
+                End If
+                
+                intCount = intCount + 1
+                If intCount <= 500 Then
+                    intersections(intCount) = intX
+                End If
+            End If
+        Next e
+        
+        ' Sort intersections
+        If intCount > 1 Then
+            Dim si As Long
+            Dim sj As Long
+            Dim stmp As Double
+            For si = 1 To intCount - 1
+                For sj = si + 1 To intCount
+                    If intersections(si) > intersections(sj) Then
+                        stmp = intersections(si)
+                        intersections(si) = intersections(sj)
+                        intersections(sj) = stmp
+                    End If
+                Next sj
+            Next si
+        End If
+        
+        ' Fill between pairs of intersections
+        Dim pair As Long
+        For pair = 1 To intCount - 1 Step 2
+            Dim fillStart As Long
+            Dim fillEnd As Long
+            fillStart = CLng(intersections(pair))
+            fillEnd = CLng(intersections(pair + 1))
+            
+            If fillStart < 0 Then fillStart = 0
+            If fillEnd >= fpW Then fillEnd = fpW - 1
+            
+            Dim col As Long
+            For col = fillStart To fillEnd
+                If col >= 0 And col < fpW Then
+                    fp(col, row) = True
+                End If
+            Next col
+        Next pair
+    Next row
+    
+    ' Also fill a border of 1 pixel around the filled area (gap buffer)
+    Dim bpi As Long
+    Dim bpj As Long
+    Dim tempFP() As Boolean
+    ReDim tempFP(0 To fpW - 1, 0 To fpH - 1)
+    
+    ' Copy original
+    For bpj = 0 To fpH - 1
+        For bpi = 0 To fpW - 1
+            tempFP(bpi, bpj) = fp(bpi, bpj)
+        Next bpi
+    Next bpj
+    
+    ' Expand by 1 pixel in all directions
+    For bpj = 0 To fpH - 1
+        For bpi = 0 To fpW - 1
+            If tempFP(bpi, bpj) Then
+                ' Mark neighbors
+                If bpi > 0 Then fp(bpi - 1, bpj) = True
+                If bpi < fpW - 1 Then fp(bpi + 1, bpj) = True
+                If bpj > 0 Then fp(bpi, bpj - 1) = True
+                If bpj < fpH - 1 Then fp(bpi, bpj + 1) = True
+            End If
+        Next bpi
+    Next bpj
+    
 End Sub
 
 
 ' ============================================================================
-' DRAW MARGIN BOUNDARY RECTANGLE ON PAGE
-' Shows the usable cutting area as a light grey dashed box
+' COLLECT NODE POINTS from a shape (recursive for groups)
 ' ============================================================================
-Private Sub DrawMarginBox(ByRef pg As Page)
+Private Sub CollectNodes(ByRef shp As Shape, ByVal origX As Double, ByVal origY As Double, _
+                          ByRef nodeX() As Double, ByRef nodeY() As Double, ByRef cnt As Long)
+    
     On Error Resume Next
     
-    pg.Activate
-    
-    ' Rectangle inside the margins
-    ' CreateRectangle2(Left, Bottom, Width, Height) in CorelDRAW coordinates
-    Dim rLeft As Double, rBottom As Double, rW As Double, rH As Double
-    rLeft = m_Margin
-    rBottom = m_Margin
-    rW = m_SheetW - (m_Margin * 2)
-    rH = m_SheetH - (m_Margin * 2)
-    
-    Dim rect As Shape
-    Set rect = ActiveLayer.CreateRectangle2(rLeft, rBottom, rW, rH)
-    
-    If Not rect Is Nothing Then
-        rect.Outline.SetProperties 0.1
-        rect.Outline.Color.GrayAssign 60
-        rect.Fill.ApplyNoFill
-        rect.Locked = True
-        rect.Name = "ShoeNester_MarginBorder"
+    ' If it's a group, recurse into children
+    If shp.Type = cdrGroupShape Then
+        Dim child As Shape
+        For Each child In shp.Shapes
+            Call CollectNodes(child, origX, origY, nodeX, nodeY, cnt)
+        Next child
+        Exit Sub
     End If
+    
+    ' Try to access curve data
+    Dim crv As Curve
+    Set crv = shp.Curve
+    
+    If crv Is Nothing Then
+        ' Not a curve - use bounding box corners as nodes
+        cnt = cnt + 1: If cnt <= 5000 Then nodeX(cnt) = (shp.LeftX - origX) / CELL: nodeY(cnt) = (shp.BottomY - origY) / CELL
+        cnt = cnt + 1: If cnt <= 5000 Then nodeX(cnt) = (shp.LeftX + shp.SizeWidth - origX) / CELL: nodeY(cnt) = (shp.BottomY - origY) / CELL
+        cnt = cnt + 1: If cnt <= 5000 Then nodeX(cnt) = (shp.LeftX + shp.SizeWidth - origX) / CELL: nodeY(cnt) = (shp.BottomY + shp.SizeHeight - origY) / CELL
+        cnt = cnt + 1: If cnt <= 5000 Then nodeX(cnt) = (shp.LeftX - origX) / CELL: nodeY(cnt) = (shp.BottomY + shp.SizeHeight - origY) / CELL
+        Exit Sub
+    End If
+    
+    ' Extract nodes from each subpath
+    Dim sp As SubPath
+    Dim nd As Node
+    
+    For Each sp In crv.SubPaths
+        ' For each subpath, collect nodes as a separate polygon
+        ' We'll add them all to the same list for simplicity
+        ' (works well for single-outline shapes)
+        For Each nd In sp.Nodes
+            cnt = cnt + 1
+            If cnt <= 5000 Then
+                nodeX(cnt) = (nd.PositionX - origX) / CELL
+                nodeY(cnt) = (nd.PositionY - origY) / CELL
+            End If
+        Next nd
+    Next sp
     
     On Error GoTo 0
 End Sub
 
 
 ' ============================================================================
-' HELPER: IIf replacement (VBA in CorelDRAW X5 may not have built-in IIf)
+' COLLISION TEST - Early exit
 ' ============================================================================
-Private Function MyIIf(ByVal condition As Boolean, ByVal trueVal As String, ByVal falseVal As String) As String
-    If condition Then MyIIf = trueVal Else MyIIf = falseVal
+Private Function Collides(ByRef fp() As Boolean, ByVal fw As Long, ByVal fh As Long, _
+                           ByVal ox As Long, ByVal oy As Long) As Boolean
+    Dim ci As Long
+    Dim cj As Long
+    Dim mx As Long
+    Dim my As Long
+    
+    For cj = 0 To fh - 1
+        my = oy + cj
+        If my >= m_GH Then Collides = True: Exit Function
+        For ci = 0 To fw - 1
+            If fp(ci, cj) Then
+                mx = ox + ci
+                If mx >= m_GW Then Collides = True: Exit Function
+                If m_Grid(mx, my) Then Collides = True: Exit Function
+            End If
+        Next ci
+    Next cj
+    
+    Collides = False
 End Function
+
+
+' ============================================================================
+' STAMP FOOTPRINT + UPDATE ROW CACHE
+' ============================================================================
+Private Sub Stamp(ByRef fp() As Boolean, ByVal fw As Long, ByVal fh As Long, _
+                   ByVal ox As Long, ByVal oy As Long)
+    Dim ci As Long
+    Dim cj As Long
+    Dim mx As Long
+    Dim my As Long
+    
+    For cj = 0 To fh - 1
+        my = oy + cj
+        If my >= m_GH Then Exit For
+        For ci = 0 To fw - 1
+            If fp(ci, cj) Then
+                mx = ox + ci
+                If mx < m_GW Then m_Grid(mx, my) = True
+            End If
+        Next ci
+    Next cj
+    
+    Call UpdateRowCache(oy, oy + fh - 1)
+End Sub
+
+Private Sub UpdateRowCache(ByVal fr As Long, ByVal tr As Long)
+    If tr >= m_GH Then tr = m_GH - 1
+    If fr < 0 Then fr = 0
+    Dim r As Long
+    Dim cc As Long
+    Dim full As Boolean
+    For r = fr To tr
+        full = True
+        For cc = 0 To m_GW - 1
+            If Not m_Grid(cc, r) Then full = False: Exit For
+        Next cc
+        m_RowFull(r) = full
+    Next r
+End Sub
+
+
+' ============================================================================
+' GRID INIT
+' ============================================================================
+Private Sub InitGrid()
+    m_GW = CLng(m_UsableW / CELL) + 1
+    m_GH = CLng(m_UsableH / CELL) + 1
+    If m_GW > 2000 Then m_GW = 2000
+    If m_GH > 2000 Then m_GH = 2000
+    ReDim m_Grid(0 To m_GW - 1, 0 To m_GH - 1)
+    ReDim m_RowFull(0 To m_GH - 1)
+    Dim x As Long
+    Dim y As Long
+    For y = 0 To m_GH - 1
+        m_RowFull(y) = False
+        For x = 0 To m_GW - 1
+            m_Grid(x, y) = False
+        Next x
+    Next y
+End Sub
+
+
+' ============================================================================
+' DRAW MARGIN BOX
+' ============================================================================
+Private Sub DrawBox(ByRef pg As Page)
+    On Error Resume Next
+    pg.Activate
+    Dim rect As Shape
+    Set rect = ActiveLayer.CreateRectangle2(m_Margin, m_Margin, m_UsableW, m_UsableH)
+    If Not rect Is Nothing Then
+        rect.Outline.Width = 0.1
+        Dim clr As New Color
+        clr.GrayAssign 60
+        rect.Outline.Color = clr
+        rect.Fill.ApplyNoFill
+        rect.Locked = True
+    End If
+    On Error GoTo 0
+End Sub
